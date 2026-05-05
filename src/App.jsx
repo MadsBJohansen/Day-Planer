@@ -18,55 +18,43 @@ async function sbGet(table, params = "") {
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
-
-async function sbUpsert(table, data) {
-  const res = await fetch(`${SB_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: { ...HEADERS, "Prefer": "resolution=merge-duplicates,return=representation" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
 async function sbUpdate(table, match, data) {
   const params = Object.entries(match).map(([k,v])=>`${k}=eq.${v}`).join("&");
   const res = await fetch(`${SB_URL}/rest/v1/${table}?${params}`, {
-    method: "PATCH",
-    headers: HEADERS,
-    body: JSON.stringify(data),
+    method: "PATCH", headers: HEADERS, body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
-
 async function sbDelete(table, match) {
   const params = Object.entries(match).map(([k,v])=>`${k}=eq.${v}`).join("&");
-  const res = await fetch(`${SB_URL}/rest/v1/${table}?${params}`, {
-    method: "DELETE",
-    headers: HEADERS,
-  });
+  const res = await fetch(`${SB_URL}/rest/v1/${table}?${params}`, { method: "DELETE", headers: HEADERS });
   if (!res.ok) throw new Error(await res.text());
 }
-
 async function sbInsert(table, data) {
   const res = await fetch(`${SB_URL}/rest/v1/${table}`, {
-    method: "POST",
-    headers: HEADERS,
-    body: JSON.stringify(data),
+    method: "POST", headers: HEADERS, body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 // ─────────────────────────────────────────────
-// DB ↔ APP  row mapping
+// ROW MAPPING
 // ─────────────────────────────────────────────
 function rowToTask(r) {
-  return { id: r.id, name: r.name, person: r.person, frequency: r.frequency, duration: r.duration, mentalLoad: r.mental_load, done: r.done };
+  return {
+    id: r.id, name: r.name, person: r.person, frequency: r.frequency,
+    duration: r.duration, mentalLoad: r.mental_load || 0,
+    done: r.done, isOnetime: r.is_onetime || false,
+  };
 }
 function taskToRow(t) {
-  return { id: t.id, name: t.name, person: t.person, frequency: t.frequency, duration: t.duration, mental_load: t.mentalLoad || 0, done: t.done };
+  return {
+    id: t.id, name: t.name, person: t.person, frequency: t.frequency,
+    duration: t.duration, mental_load: t.mentalLoad || 0,
+    done: t.done, is_onetime: t.isOnetime || false,
+  };
 }
 
 // ─────────────────────────────────────────────
@@ -99,65 +87,69 @@ function fmtDate(key) {
 async function runAutoReset(tasks) {
   const dk = todayKey();
   const wk = weekKey();
-  let metaRows = await sbGet("meta", "id=eq.1");
+  const metaRows = await sbGet("meta", "id=eq.1");
   const meta = metaRows[0] || {};
 
-  let changed = false;
-
   if (meta.last_day_key && meta.last_day_key !== dk) {
-    // Snapshot daily tasks into history
-    const dailyTasks = tasks.filter(t => t.frequency === "daily");
-    if (dailyTasks.length) {
-      await sbInsert("history", dailyTasks.map(t => ({
+    const daily = tasks.filter(t => t.frequency === "daily" && !t.isOnetime);
+    if (daily.length) {
+      await sbInsert("history", daily.map(t => ({
         period_key: meta.last_day_key, task_id: t.id, name: t.name,
         person: t.person, frequency: t.frequency, duration: t.duration,
-        mental_load: t.mentalLoad || 0, done: t.done,
+        mental_load: t.mentalLoad || 0, done: t.done, is_onetime: false,
       })));
     }
-    // Reset daily tasks
-    for (const t of dailyTasks) await sbUpdate("tasks", { id: t.id }, { done: false });
-    changed = true;
+    for (const t of daily) await sbUpdate("tasks", { id: t.id }, { done: false });
+    // Snapshot + delete completed one-time tasks
+    const onetimeDone = tasks.filter(t => t.isOnetime && t.done);
+    if (onetimeDone.length) {
+      await sbInsert("history", onetimeDone.map(t => ({
+        period_key: meta.last_day_key, task_id: t.id, name: t.name,
+        person: t.person, frequency: "onetime", duration: t.duration,
+        mental_load: t.mentalLoad || 0, done: true, is_onetime: true,
+      })));
+      for (const t of onetimeDone) await sbDelete("tasks", { id: t.id });
+    }
   }
 
   if (meta.last_week_key && meta.last_week_key !== wk) {
-    const weeklyTasks = tasks.filter(t => t.frequency === "weekly");
-    if (weeklyTasks.length) {
-      await sbInsert("history", weeklyTasks.map(t => ({
+    const weekly = tasks.filter(t => t.frequency === "weekly" && !t.isOnetime);
+    if (weekly.length) {
+      await sbInsert("history", weekly.map(t => ({
         period_key: meta.last_week_key, task_id: t.id, name: t.name,
         person: t.person, frequency: t.frequency, duration: t.duration,
-        mental_load: t.mentalLoad || 0, done: t.done,
+        mental_load: t.mentalLoad || 0, done: t.done, is_onetime: false,
       })));
     }
-    for (const t of weeklyTasks) await sbUpdate("tasks", { id: t.id }, { done: false });
-    changed = true;
+    for (const t of weekly) await sbUpdate("tasks", { id: t.id }, { done: false });
   }
 
   await sbUpdate("meta", { id: 1 }, { last_day_key: dk, last_week_key: wk });
-  return changed;
 }
 
 // ─────────────────────────────────────────────
-// DEFAULT TASKS  (seeded on first load)
+// DEFAULT TASKS
 // ─────────────────────────────────────────────
 const DEFAULT_TASKS = [
-  { id:1, name:"Gå ud med skrald",   person:"Mads",  frequency:"daily",  duration:10, mentalLoad:5,  done:false },
-  { id:2, name:"Støvsug stuen",       person:"Nadia", frequency:"weekly", duration:20, mentalLoad:5,  done:false },
-  { id:3, name:"Vask op",             person:"Mads",  frequency:"daily",  duration:15, mentalLoad:10, done:false },
-  { id:4, name:"Rengør badeværelse",  person:"Nadia", frequency:"weekly", duration:30, mentalLoad:15, done:false },
-  { id:5, name:"Tøjvask",             person:"Nadia", frequency:"weekly", duration:10, mentalLoad:20, done:false },
-  { id:6, name:"Aftør køkken",        person:"Mads",  frequency:"daily",  duration:8,  mentalLoad:3,  done:false },
+  { id:1, name:"Gå ud med skrald",   person:"Mads",   frequency:"daily",  duration:10, mentalLoad:5,  done:false, isOnetime:false },
+  { id:2, name:"Støvsug stuen",       person:"Nadia",  frequency:"weekly", duration:20, mentalLoad:5,  done:false, isOnetime:false },
+  { id:3, name:"Vask op",             person:"Mads",   frequency:"daily",  duration:15, mentalLoad:10, done:false, isOnetime:false },
+  { id:4, name:"Rengør badeværelse",  person:"Nadia",  frequency:"weekly", duration:30, mentalLoad:15, done:false, isOnetime:false },
+  { id:5, name:"Tøjvask",             person:"Nadia",  frequency:"weekly", duration:10, mentalLoad:20, done:false, isOnetime:false },
+  { id:6, name:"Aftør køkken",        person:"Mads",   frequency:"daily",  duration:8,  mentalLoad:3,  done:false, isOnetime:false },
+  { id:7, name:"Handle ind",          person:"Fælles", frequency:"weekly", duration:30, mentalLoad:10, done:false, isOnetime:false },
 ];
 
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
-const PERSONS  = ["Mads","Nadia"];
-const COLORS   = { Mads:"#4f9cf9", Nadia:"#f97bb0" };
+const PERSONS  = ["Mads", "Nadia", "Fælles"];
+const COLORS   = { Mads:"#4f9cf9", Nadia:"#f97bb0", Fælles:"#2ecc71" };
 const ML_COLOR = "#9b72cf";
 const MONTHS   = ["jan","feb","mar","apr","maj","jun","jul","aug","sep","okt","nov","dec"];
 
 function calcTime(tasks, person) {
-  const mine = tasks.filter(t=>t.person===person);
+  const mine = tasks.filter(t => t.person === person && !t.isOnetime);
   const dw = mine.filter(t=>t.frequency==="daily").reduce((s,t)=>s+t.duration,0);
   const ww = mine.filter(t=>t.frequency==="weekly").reduce((s,t)=>s+t.duration,0);
   const dm = mine.filter(t=>t.frequency==="daily").reduce((s,t)=>s+(t.mentalLoad||0),0);
@@ -169,8 +161,13 @@ function calcTime(tasks, person) {
 // MODAL
 // ─────────────────────────────────────────────
 function Modal({ task, onSave, onClose }) {
-  const [form, setForm] = useState(task ? {...task} : { name:"", person:"Mads", frequency:"daily", duration:10, mentalLoad:5 });
+  const [form, setForm] = useState(
+    task ? {...task} : { name:"", person:"Mads", frequency:"daily", duration:10, mentalLoad:5, isOnetime:false }
+  );
   const set = (k,v) => setForm(f=>({...f,[k]:v}));
+  function toggleOnetime(val) {
+    setForm(f=>({ ...f, isOnetime: val, frequency: val ? "onetime" : "daily" }));
+  }
   return (
     <div style={S.overlay} onClick={onClose}>
       <div style={S.modal} onClick={e=>e.stopPropagation()}>
@@ -187,13 +184,28 @@ function Modal({ task, onSave, onClose }) {
           ))}
         </div>
 
-        <label style={S.label}>Frekvens</label>
+        <label style={S.label}>Type</label>
         <div style={S.segRow}>
-          {[["daily","Daglig"],["weekly","Ugentlig"]].map(([v,l])=>(
-            <button key={v} style={{...S.seg,...(form.frequency===v?{background:"#1a1a2e",color:"#fff",borderColor:"#1a1a2e"}:{})}}
-              onClick={()=>set("frequency",v)}>{l}</button>
-          ))}
+          <button style={{...S.seg,...(!form.isOnetime?{background:"#1a1a2e",color:"#fff",borderColor:"#1a1a2e"}:{})}}
+            onClick={()=>toggleOnetime(false)}>Tilbagevendende</button>
+          <button style={{...S.seg,...(form.isOnetime?{background:"#e67e22",color:"#fff",borderColor:"#e67e22"}:{})}}
+            onClick={()=>toggleOnetime(true)}>Engangopgave</button>
         </div>
+
+        {!form.isOnetime && (
+          <>
+            <label style={S.label}>Frekvens</label>
+            <div style={S.segRow}>
+              {[["daily","Daglig"],["weekly","Ugentlig"]].map(([v,l])=>(
+                <button key={v} style={{...S.seg,...(form.frequency===v?{background:"#1a1a2e",color:"#fff",borderColor:"#1a1a2e"}:{})}}
+                  onClick={()=>set("frequency",v)}>{l}</button>
+              ))}
+            </div>
+          </>
+        )}
+        {form.isOnetime && (
+          <div style={S.onetimeHint}>Forsvinder automatisk fra listen når den er udført og dagen er omme.</div>
+        )}
 
         <label style={S.label}>Varighed (minutter)</label>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
@@ -221,7 +233,7 @@ function Modal({ task, onSave, onClose }) {
 // TASK CARD
 // ─────────────────────────────────────────────
 function TaskCard({ task, onToggle, onEdit, onDelete }) {
-  const color = COLORS[task.person];
+  const color = COLORS[task.person] || "#888";
   return (
     <div style={{...S.card, borderLeft:`4px solid ${color}`, opacity:task.done?0.6:1}}>
       <div style={S.cardLeft}>
@@ -233,6 +245,10 @@ function TaskCard({ task, onToggle, onEdit, onDelete }) {
           <div style={{...S.taskName,textDecoration:task.done?"line-through":"none"}}>{task.name}</div>
           <div style={S.meta}>
             <span style={{...S.badge,background:color+"22",color}}>{task.person}</span>
+            {task.isOnetime
+              ? <span style={S.onetimeBadge}>⚡ Engangopgave</span>
+              : <span style={S.badge}>{task.frequency==="daily"?"Daglig":"Ugentlig"}</span>
+            }
             <span style={S.badge}>⏱ {task.duration} min</span>
             {task.mentalLoad>0 && <span style={S.mlBadge}>🧠 {task.mentalLoad} min</span>}
           </div>
@@ -252,7 +268,7 @@ function TaskCard({ task, onToggle, onEdit, onDelete }) {
 function PersonSummary({ person, tasks }) {
   const { daily, weekly, mlDaily, mlWeekly } = calcTime(tasks, person);
   const color = COLORS[person];
-  const mine  = tasks.filter(t=>t.person===person);
+  const mine  = tasks.filter(t=>t.person===person && !t.isOnetime);
   const doneD = mine.filter(t=>t.frequency==="daily"  && t.done).length;
   const doneW = mine.filter(t=>t.frequency==="weekly" && t.done).length;
   const totD  = mine.filter(t=>t.frequency==="daily").length;
@@ -262,13 +278,13 @@ function PersonSummary({ person, tasks }) {
     <div style={{...S.summary, borderTop:`3px solid ${color}`}}>
       <div style={{...S.personName,color}}>{person}</div>
       <div>
-        <div style={S.statSLbl}>⏱ Opgavetid</div>
+        <div style={S.statSLbl}>⏱ Tid</div>
         <div style={S.statRow}>
           <div style={S.stat}><span style={S.statNum}>{daily}</span><span style={S.statLbl}>min/dag</span></div>
           <div style={S.stat}><span style={S.statNum}>{weekly}</span><span style={S.statLbl}>min/uge</span></div>
         </div>
       </div>
-      <div style={{borderTop:"1px solid #f0ece8",marginTop:8,paddingTop:8}}>
+      <div style={{borderTop:"1px solid #f0ece8",marginTop:6,paddingTop:6}}>
         <div style={{...S.statSLbl,color:ML_COLOR}}>🧠 Mental load</div>
         <div style={S.statRow}>
           <div style={S.stat}><span style={{...S.statNum,color:ML_COLOR}}>{mlDaily}</span><span style={S.statLbl}>min/dag</span></div>
@@ -298,8 +314,8 @@ function Statistics({ history }) {
 
   return (
     <div style={{paddingBottom:32}}>
-      <div style={{display:"flex",gap:6,padding:"12px 16px 4px"}}>
-        {["all","Mads","Nadia"].map(f=>(
+      <div style={{display:"flex",gap:6,padding:"12px 16px 4px",flexWrap:"wrap"}}>
+        {["all","Mads","Nadia","Fælles"].map(f=>(
           <button key={f} style={{...S.filterBtn,...(selP===f?S.filterActive:{})}} onClick={()=>setSelP(f)}>
             {f==="all"?"Alle":f}
           </button>
@@ -336,10 +352,11 @@ function Statistics({ history }) {
               <div key={i} style={{...S.histRow,opacity:e.done?1:0.5}}>
                 <span style={{...S.histDot,background:COLORS[e.person]||"#ccc"}}/>
                 <span style={{flex:1,fontSize:13,textDecoration:e.done?"none":"line-through",color:"#333"}}>{e.name}</span>
+                {e.is_onetime && <span style={{...S.onetimeBadge,fontSize:10}}>⚡</span>}
                 <span style={S.histTag}>⏱ {e.duration}m</span>
                 {e.mental_load>0&&<span style={{...S.histTag,color:ML_COLOR,background:"#f0e8ff"}}>🧠 {e.mental_load}m</span>}
                 <span style={{...S.histTag,background:e.done?"#e6f9ee":"#fee",color:e.done?"#27ae60":"#c0392b"}}>
-                  {e.done?"✓ Udført":"✗ Ikke udført"}
+                  {e.done?"✓":"✗"}
                 </span>
               </div>
             ))}
@@ -360,14 +377,12 @@ export default function App() {
   const [tasks,   setTasks]   = useState([]);
   const [history, setHistory] = useState([]);
   const [modal,   setModal]   = useState(null);
-  const [filter,  setFilter]  = useState("all");
   const [tab,     setTab]     = useState("daily");
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState(null);
   const [syncAt,  setSyncAt]  = useState(null);
   const pollRef = useRef(null);
 
-  // ── Fetch all data from Supabase ──
   const fetchAll = useCallback(async () => {
     const [taskRows, histRows] = await Promise.all([
       sbGet("tasks", "order=id"),
@@ -378,11 +393,9 @@ export default function App() {
     setSyncAt(Date.now());
   }, []);
 
-  // ── Initial boot ──
   useEffect(()=>{
     (async()=>{
       try {
-        // Seed default tasks if table is empty
         const existing = await sbGet("tasks", "select=id");
         if (existing.length === 0) {
           await sbInsert("tasks", DEFAULT_TASKS.map(taskToRow));
@@ -399,19 +412,17 @@ export default function App() {
     })();
   }, [fetchAll]);
 
-  // ── Poll every 8 seconds for changes from the other device ──
   useEffect(()=>{
     if (loading) return;
     pollRef.current = setInterval(fetchAll, 8_000);
     return ()=>clearInterval(pollRef.current);
   }, [loading, fetchAll]);
 
-  // ── Actions ──
   async function toggle(id) {
     const task = tasks.find(t=>t.id===id);
     if (!task) return;
     const newDone = !task.done;
-    setTasks(ts=>ts.map(t=>t.id===id?{...t,done:newDone}:t)); // optimistic
+    setTasks(ts=>ts.map(t=>t.id===id?{...t,done:newDone}:t));
     await sbUpdate("tasks", { id }, { done: newDone });
   }
 
@@ -433,14 +444,27 @@ export default function App() {
     await sbDelete("tasks", { id });
   }
 
-  // ── Render ──
-  const visible = filter==="all" ? tasks : tasks.filter(t=>t.person===filter);
+  const tabTasks = {
+    daily:   tasks.filter(t=>t.frequency==="daily"  && !t.isOnetime && t.person!=="Fælles"),
+    weekly:  tasks.filter(t=>t.frequency==="weekly" && !t.isOnetime && t.person!=="Fælles"),
+    faelles: tasks.filter(t=>t.person==="Fælles"   && !t.isOnetime),
+    onetime: tasks.filter(t=>t.isOnetime),
+  };
+
   const dk = todayKey();
   const wk = weekKey();
   const [yr,mo,dy] = dk.split("-");
   const todayLabel = `${parseInt(dy)}. ${MONTHS[parseInt(mo)-1]} ${yr}`;
   const weekLabel  = `Uge ${wk.split("-W")[1]}`;
   const syncLabel  = syncAt ? new Date(syncAt).toLocaleTimeString("da-DK",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "—";
+
+  const TAB_DEFS = [
+    { key:"daily",   label:"Daglige",      count: tabTasks.daily.length },
+    { key:"weekly",  label:"Ugentlige",    count: tabTasks.weekly.length },
+    { key:"faelles", label:"🤝 Fælles",    count: tabTasks.faelles.length },
+    { key:"onetime", label:"⚡ Engangs",   count: tabTasks.onetime.length },
+    { key:"stats",   label:"Statistik",    count: [...new Set(history.map(r=>r.period_key))].length },
+  ];
 
   if (loading) return (
     <div style={{...S.root,display:"flex",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
@@ -461,9 +485,10 @@ export default function App() {
     </div>
   );
 
+  const currentTasks = tabTasks[tab] || [];
+
   return (
     <div style={S.root}>
-      {/* HEADER */}
       <div style={S.header}>
         <div>
           <div style={S.appTitle}>Huskelisten</div>
@@ -472,44 +497,28 @@ export default function App() {
         <button style={S.btnAdd} onClick={()=>setModal({})}>+ Ny opgave</button>
       </div>
 
-      {/* SYNC BAR */}
       <div style={S.syncBar}>
         <span style={S.syncDot}/>
         <span>Supabase · Opdateret {syncLabel}</span>
         <button style={S.syncBtn} onClick={fetchAll}>↺ Hent nu</button>
       </div>
 
-      {/* PERSON SUMMARIES */}
       <div style={S.summaryRow}>
         {PERSONS.map(p=><PersonSummary key={p} person={p} tasks={tasks}/>)}
       </div>
 
-      {/* TABS */}
       <div style={S.tabBar}>
-        <div style={S.tabGroup}>
-          {[
-            ["daily",  "Daglige",   tasks.filter(t=>t.frequency==="daily").length],
-            ["weekly", "Ugentlige", tasks.filter(t=>t.frequency==="weekly").length],
-            ["stats",  "Statistik", [...new Set(history.map(r=>r.period_key))].length],
-          ].map(([key,label,count])=>(
+        <div style={{...S.tabGroup,flexWrap:"wrap"}}>
+          {TAB_DEFS.map(({key,label,count})=>(
             <button key={key} style={{...S.tab,...(tab===key?S.tabActive:{})}} onClick={()=>setTab(key)}>
               {label}
               <span style={{...S.tabCount,...(tab===key?S.tabCountActive:{})}}>{count}</span>
             </button>
           ))}
         </div>
-        {tab!=="stats" && (
-          <div style={S.tabRight}>
-            {["all","Mads","Nadia"].map(f=>(
-              <button key={f} style={{...S.filterBtn,...(filter===f?S.filterActive:{})}}
-                onClick={()=>setFilter(f)}>{f==="all"?"Alle":f}</button>
-            ))}
-          </div>
-        )}
       </div>
 
-      {/* DATE CONTEXT */}
-      {tab!=="stats" && (
+      {(tab==="daily"||tab==="weekly") && (
         <div style={S.dateCtx}>
           {tab==="daily"
             ? <><span>📅</span> I dag: <strong>{todayLabel}</strong><span style={S.resetHint}> — nulstilles automatisk kl. 00:00</span></>
@@ -517,27 +526,24 @@ export default function App() {
           }
         </div>
       )}
+      {tab==="faelles" && <div style={S.dateCtx}><span>🤝</span> Opgaver for jer begge</div>}
+      {tab==="onetime" && <div style={S.dateCtx}><span>⚡</span> Forsvinder automatisk når de er udført og dagen er omme</div>}
 
-      {/* TASK LIST */}
       {tab!=="stats" && (
         <section style={{paddingTop:8}}>
-          {visible.filter(t=>t.frequency===tab).length===0
+          {currentTasks.length===0
             ? <div style={S.empty}>
-                {filter!=="all"
-                  ? `Ingen ${tab==="daily"?"daglige":"ugentlige"} opgaver for ${filter}.`
-                  : `Ingen ${tab==="daily"?"daglige":"ugentlige"} opgaver endnu. Tilføj en!`}
+                {tab==="onetime" ? "Ingen engangopgaver — tilføj en med + Ny opgave!" : "Ingen opgaver her endnu."}
               </div>
-            : visible.filter(t=>t.frequency===tab).map(t=>
+            : currentTasks.map(t=>
                 <TaskCard key={t.id} task={t} onToggle={toggle} onEdit={setModal} onDelete={deleteTask}/>
               )
           }
         </section>
       )}
 
-      {/* STATISTICS */}
       {tab==="stats" && <Statistics history={history}/>}
 
-      {/* MODAL */}
       {modal!==null && (
         <Modal task={modal?.id?modal:null} onSave={saveTask} onClose={()=>setModal(null)}/>
       )}
@@ -559,25 +565,24 @@ const S = {
   syncDot:       { width:7, height:7, borderRadius:"50%", background:"#27ae60", flexShrink:0 },
   syncBtn:       { marginLeft:"auto", background:"transparent", border:"1px solid #a0c4e8", borderRadius:6, padding:"2px 10px", fontSize:11, color:"#4a7ab5", cursor:"pointer" },
 
-  summaryRow:    { display:"flex", gap:12, padding:"16px 16px 0" },
-  summary:       { flex:1, background:"#fff", borderRadius:10, padding:"14px 16px", boxShadow:"0 1px 4px #0001" },
-  personName:    { fontWeight:700, fontSize:16, marginBottom:8 },
+  summaryRow:    { display:"flex", gap:8, padding:"16px 16px 0", overflowX:"auto" },
+  summary:       { flex:"0 0 auto", minWidth:130, background:"#fff", borderRadius:10, padding:"12px 14px", boxShadow:"0 1px 4px #0001" },
+  personName:    { fontWeight:700, fontSize:14, marginBottom:8 },
   statSLbl:      { fontSize:10, fontWeight:700, textTransform:"uppercase", letterSpacing:0.5, color:"#aaa", marginBottom:4 },
-  statRow:       { display:"flex", gap:16, marginBottom:8 },
+  statRow:       { display:"flex", gap:12, marginBottom:6 },
   stat:          { display:"flex", flexDirection:"column", alignItems:"center" },
-  statNum:       { fontSize:22, fontWeight:700, color:"#1a1a2e" },
-  statLbl:       { fontSize:10, color:"#888", textTransform:"uppercase", letterSpacing:0.5 },
-  progressLabel: { fontSize:11, color:"#888", marginBottom:5, marginTop:6 },
-  progressBg:    { height:6, background:"#eee", borderRadius:3, overflow:"hidden" },
+  statNum:       { fontSize:18, fontWeight:700, color:"#1a1a2e" },
+  statLbl:       { fontSize:9, color:"#888", textTransform:"uppercase", letterSpacing:0.5 },
+  progressLabel: { fontSize:10, color:"#888", marginBottom:4, marginTop:6 },
+  progressBg:    { height:5, background:"#eee", borderRadius:3, overflow:"hidden" },
   progressFill:  { height:"100%", borderRadius:3, transition:"width .4s" },
 
-  tabBar:        { display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px 0", gap:8, flexWrap:"wrap" },
+  tabBar:        { padding:"12px 16px 0" },
   tabGroup:      { display:"flex", background:"#e8e4df", borderRadius:10, padding:3, gap:2 },
-  tab:           { border:"none", borderRadius:8, padding:"7px 12px", fontSize:13, fontWeight:600, cursor:"pointer", background:"transparent", color:"#888", display:"flex", alignItems:"center", gap:5, transition:"all .18s" },
+  tab:           { border:"none", borderRadius:8, padding:"6px 10px", fontSize:12, fontWeight:600, cursor:"pointer", background:"transparent", color:"#888", display:"flex", alignItems:"center", gap:4, transition:"all .18s", whiteSpace:"nowrap" },
   tabActive:     { background:"#1a1a2e", color:"#fff", boxShadow:"0 1px 4px #0002" },
-  tabCount:      { fontSize:11, background:"#ccc", color:"#666", borderRadius:10, padding:"1px 6px", fontWeight:700 },
+  tabCount:      { fontSize:10, background:"#ccc", color:"#666", borderRadius:10, padding:"1px 5px", fontWeight:700 },
   tabCountActive:{ background:"#f0c040", color:"#1a1a2e" },
-  tabRight:      { display:"flex", gap:6, alignItems:"center" },
   filterBtn:     { background:"transparent", border:"1.5px solid #ccc", borderRadius:20, padding:"5px 12px", fontSize:13, cursor:"pointer", color:"#555" },
   filterActive:  { background:"#1a1a2e", color:"#fff", borderColor:"#1a1a2e" },
 
@@ -590,6 +595,8 @@ const S = {
   meta:          { display:"flex", gap:6, flexWrap:"wrap" },
   badge:         { fontSize:11, background:"#f0f0f0", color:"#555", borderRadius:20, padding:"2px 8px" },
   mlBadge:       { fontSize:11, background:"#f0e8ff", color:"#9b72cf", borderRadius:20, padding:"2px 8px" },
+  onetimeBadge:  { fontSize:11, background:"#fff3e0", color:"#e67e22", borderRadius:20, padding:"2px 8px" },
+  onetimeHint:   { fontSize:12, color:"#e67e22", background:"#fff3e0", borderRadius:8, padding:"8px 12px", marginTop:8 },
   check:         { width:26, height:26, borderRadius:"50%", border:"2px solid", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", flexShrink:0, transition:"background .2s" },
   cardActions:   { display:"flex", gap:4, marginLeft:8 },
   iconBtn:       { background:"transparent", border:"none", fontSize:16, cursor:"pointer", color:"#999", padding:"4px 6px", borderRadius:6 },
@@ -612,7 +619,7 @@ const S = {
   label:         { display:"block", fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:0.5, color:"#888", marginBottom:6, marginTop:14 },
   input:         { width:"100%", border:"1.5px solid #ddd", borderRadius:8, padding:"9px 12px", fontSize:15, boxSizing:"border-box", outline:"none" },
   segRow:        { display:"flex", gap:8 },
-  seg:           { flex:1, border:"1.5px solid #ddd", borderRadius:8, padding:"8px", fontSize:14, cursor:"pointer", background:"#fafafa", transition:"all .15s" },
+  seg:           { flex:1, border:"1.5px solid #ddd", borderRadius:8, padding:"8px", fontSize:13, cursor:"pointer", background:"#fafafa", transition:"all .15s" },
   durBadge:      { minWidth:60, textAlign:"center", fontSize:14, fontWeight:700, color:"#1a1a2e" },
   mlHint:        { fontSize:11, color:"#aaa", marginBottom:8, marginTop:-2 },
   btnPrimary:    { flex:1, background:"#1a1a2e", color:"#fff", border:"none", borderRadius:8, padding:"11px", fontSize:15, fontWeight:700, cursor:"pointer" },
