@@ -19,7 +19,7 @@ async function sbGet(table, params = "") {
   return res.json();
 }
 async function sbUpdate(table, match, data) {
-  const params = Object.entries(match).map(([k,v])=>`${k}=eq.${v}`).join("&");
+  const params = Object.entries(match).map(([k,v])=>`${k}=eq.${encodeURIComponent(v)}`).join("&");
   const res = await fetch(`${SB_URL}/rest/v1/${table}?${params}`, {
     method: "PATCH", headers: HEADERS, body: JSON.stringify(data),
   });
@@ -27,7 +27,7 @@ async function sbUpdate(table, match, data) {
   return res.json();
 }
 async function sbDelete(table, match) {
-  const params = Object.entries(match).map(([k,v])=>`${k}=eq.${v}`).join("&");
+  const params = Object.entries(match).map(([k,v])=>`${k}=eq.${encodeURIComponent(v)}`).join("&");
   const res = await fetch(`${SB_URL}/rest/v1/${table}?${params}`, { method: "DELETE", headers: HEADERS });
   if (!res.ok) throw new Error(await res.text());
 }
@@ -47,6 +47,7 @@ function rowToTask(r) {
     id: r.id, name: r.name, person: r.person, frequency: r.frequency,
     duration: r.duration, mentalLoad: r.mental_load || 0,
     done: r.done, isOnetime: r.is_onetime || false,
+    completedBy: r.completed_by || null,
   };
 }
 function taskToRow(t) {
@@ -54,6 +55,7 @@ function taskToRow(t) {
     id: t.id, name: t.name, person: t.person, frequency: t.frequency,
     duration: t.duration, mental_load: t.mentalLoad || 0,
     done: t.done, is_onetime: t.isOnetime || false,
+    completed_by: t.completedBy || null,
   };
 }
 
@@ -97,16 +99,18 @@ async function runAutoReset(tasks) {
         period_key: meta.last_day_key, task_id: t.id, name: t.name,
         person: t.person, frequency: t.frequency, duration: t.duration,
         mental_load: t.mentalLoad || 0, done: t.done, is_onetime: false,
+        completed_by: t.completedBy || null,
       })));
     }
-    for (const t of daily) await sbUpdate("tasks", { id: t.id }, { done: false });
-    // Snapshot + delete completed one-time tasks
+    for (const t of daily) await sbUpdate("tasks", { id: t.id }, { done: false, completed_by: null });
+
     const onetimeDone = tasks.filter(t => t.isOnetime && t.done);
     if (onetimeDone.length) {
       await sbInsert("history", onetimeDone.map(t => ({
         period_key: meta.last_day_key, task_id: t.id, name: t.name,
         person: t.person, frequency: "onetime", duration: t.duration,
         mental_load: t.mentalLoad || 0, done: true, is_onetime: true,
+        completed_by: t.completedBy || null,
       })));
       for (const t of onetimeDone) await sbDelete("tasks", { id: t.id });
     }
@@ -119,9 +123,10 @@ async function runAutoReset(tasks) {
         period_key: meta.last_week_key, task_id: t.id, name: t.name,
         person: t.person, frequency: t.frequency, duration: t.duration,
         mental_load: t.mentalLoad || 0, done: t.done, is_onetime: false,
+        completed_by: t.completedBy || null,
       })));
     }
-    for (const t of weekly) await sbUpdate("tasks", { id: t.id }, { done: false });
+    for (const t of weekly) await sbUpdate("tasks", { id: t.id }, { done: false, completed_by: null });
   }
 
   await sbUpdate("meta", { id: 1 }, { last_day_key: dk, last_week_key: wk });
@@ -131,30 +136,68 @@ async function runAutoReset(tasks) {
 // DEFAULT TASKS
 // ─────────────────────────────────────────────
 const DEFAULT_TASKS = [
-  { id:1, name:"Gå ud med skrald",   person:"Mads",   frequency:"daily",  duration:10, mentalLoad:5,  done:false, isOnetime:false },
-  { id:2, name:"Støvsug stuen",       person:"Nadia",  frequency:"weekly", duration:20, mentalLoad:5,  done:false, isOnetime:false },
-  { id:3, name:"Vask op",             person:"Mads",   frequency:"daily",  duration:15, mentalLoad:10, done:false, isOnetime:false },
-  { id:4, name:"Rengør badeværelse",  person:"Nadia",  frequency:"weekly", duration:30, mentalLoad:15, done:false, isOnetime:false },
-  { id:5, name:"Tøjvask",             person:"Nadia",  frequency:"weekly", duration:10, mentalLoad:20, done:false, isOnetime:false },
-  { id:6, name:"Aftør køkken",        person:"Mads",   frequency:"daily",  duration:8,  mentalLoad:3,  done:false, isOnetime:false },
-  { id:7, name:"Handle ind",          person:"Fælles", frequency:"weekly", duration:30, mentalLoad:10, done:false, isOnetime:false },
+  { id:1, name:"Gå ud med skrald",   person:"Mads",   frequency:"daily",  duration:10, mentalLoad:5,  done:false, isOnetime:false, completedBy:null },
+  { id:2, name:"Støvsug stuen",       person:"Nadia",  frequency:"weekly", duration:20, mentalLoad:5,  done:false, isOnetime:false, completedBy:null },
+  { id:3, name:"Vask op",             person:"Mads",   frequency:"daily",  duration:15, mentalLoad:10, done:false, isOnetime:false, completedBy:null },
+  { id:4, name:"Rengør badeværelse",  person:"Nadia",  frequency:"weekly", duration:30, mentalLoad:15, done:false, isOnetime:false, completedBy:null },
+  { id:5, name:"Tøjvask",             person:"Nadia",  frequency:"weekly", duration:10, mentalLoad:20, done:false, isOnetime:false, completedBy:null },
+  { id:6, name:"Aftør køkken",        person:"Mads",   frequency:"daily",  duration:8,  mentalLoad:3,  done:false, isOnetime:false, completedBy:null },
+  { id:7, name:"Handle ind",          person:"Fælles", frequency:"weekly", duration:30, mentalLoad:10, done:false, isOnetime:false, completedBy:null },
 ];
 
 // ─────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────
 const PERSONS  = ["Mads", "Nadia", "Fælles"];
+const SOLO     = ["Mads", "Nadia"];
 const COLORS   = { Mads:"#4f9cf9", Nadia:"#f97bb0", Fælles:"#2ecc71" };
 const ML_COLOR = "#9b72cf";
 const MONTHS   = ["jan","feb","mar","apr","maj","jun","jul","aug","sep","okt","nov","dec"];
 
+// ─── Time calculation ───
+// For Fælles tasks: time goes to completedBy person (if done), otherwise split or ignored
 function calcTime(tasks, person) {
-  const mine = tasks.filter(t => t.person === person && !t.isOnetime);
-  const dw = mine.filter(t=>t.frequency==="daily").reduce((s,t)=>s+t.duration,0);
-  const ww = mine.filter(t=>t.frequency==="weekly").reduce((s,t)=>s+t.duration,0);
-  const dm = mine.filter(t=>t.frequency==="daily").reduce((s,t)=>s+(t.mentalLoad||0),0);
-  const wm = mine.filter(t=>t.frequency==="weekly").reduce((s,t)=>s+(t.mentalLoad||0),0);
+  const directTasks = tasks.filter(t => t.person === person && !t.isOnetime);
+  const faellesDone = tasks.filter(t => t.person === "Fælles" && !t.isOnetime && t.done && t.completedBy === person);
+
+  const allRelevant = [...directTasks, ...faellesDone];
+
+  const dw = allRelevant.filter(t=>t.frequency==="daily").reduce((s,t)=>s+t.duration,0);
+  const ww = allRelevant.filter(t=>t.frequency==="weekly").reduce((s,t)=>s+t.duration,0);
+  const dm = allRelevant.filter(t=>t.frequency==="daily").reduce((s,t)=>s+(t.mentalLoad||0),0);
+  const wm = allRelevant.filter(t=>t.frequency==="weekly").reduce((s,t)=>s+(t.mentalLoad||0),0);
   return { daily:dw, weekly:dw*7+ww, mlDaily:dm, mlWeekly:dm*7+wm };
+}
+
+// ─────────────────────────────────────────────
+// CLAIM MODAL — who completed a fælles task?
+// ─────────────────────────────────────────────
+function ClaimModal({ task, onClaim, onUnclaim, onClose }) {
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{...S.modal, maxWidth:320}} onClick={e=>e.stopPropagation()}>
+        <h2 style={{...S.modalTitle, fontSize:17}}>Hvem udførte opgaven?</h2>
+        <div style={{fontSize:14, color:"#555", marginBottom:20}}>
+          <strong>{task.name}</strong> er en fællesopgave. Vælg hvem der har udført den — tiden tælles med til den person.
+        </div>
+        <div style={S.segRow}>
+          {SOLO.map(p=>(
+            <button key={p}
+              style={{...S.seg, ...(task.completedBy===p ? {background:COLORS[p],color:"#fff",borderColor:COLORS[p]} : {})}}
+              onClick={()=>onClaim(p)}>
+              {p}
+            </button>
+          ))}
+        </div>
+        {task.completedBy && (
+          <button style={{...S.btnGhost, marginTop:12, width:"100%"}} onClick={onUnclaim}>
+            Fjern afkrydsning
+          </button>
+        )}
+        <button style={{...S.btnGhost, marginTop:8, width:"100%"}} onClick={onClose}>Annuller</button>
+      </div>
+    </div>
+  );
 }
 
 // ─────────────────────────────────────────────
@@ -233,18 +276,35 @@ function Modal({ task, onSave, onClose }) {
 // TASK CARD
 // ─────────────────────────────────────────────
 function TaskCard({ task, onToggle, onEdit, onDelete }) {
+  const isFaelles = task.person === "Fælles";
   const color = COLORS[task.person] || "#888";
+  const completedColor = task.completedBy ? COLORS[task.completedBy] : null;
+
   return (
-    <div style={{...S.card, borderLeft:`4px solid ${color}`, opacity:task.done?0.6:1}}>
+    <div style={{...S.card, borderLeft:`4px solid ${color}`, opacity:(task.done&&!isFaelles)?0.6:1}}>
       <div style={S.cardLeft}>
-        <button style={{...S.check, borderColor:color, background:task.done?color:"transparent"}}
-          onClick={()=>onToggle(task.id)}>
+        <button
+          style={{
+            ...S.check,
+            borderColor: completedColor || color,
+            background: task.done ? (completedColor || color) : "transparent",
+          }}
+          onClick={()=>onToggle(task)}>
           {task.done && <span style={{color:"#fff",fontSize:13,fontWeight:700}}>✓</span>}
         </button>
         <div>
-          <div style={{...S.taskName,textDecoration:task.done?"line-through":"none"}}>{task.name}</div>
+          <div style={{...S.taskName, textDecoration:task.done&&!isFaelles?"line-through":"none"}}>{task.name}</div>
           <div style={S.meta}>
             <span style={{...S.badge,background:color+"22",color}}>{task.person}</span>
+            {/* For fælles: show who completed it */}
+            {isFaelles && task.done && task.completedBy && (
+              <span style={{...S.badge, background:COLORS[task.completedBy]+"22", color:COLORS[task.completedBy], fontWeight:700}}>
+                ✓ {task.completedBy}
+              </span>
+            )}
+            {isFaelles && !task.done && (
+              <span style={{...S.badge, color:"#aaa"}}>Ingen har taget den endnu</span>
+            )}
             {task.isOnetime
               ? <span style={S.onetimeBadge}>⚡ Engangopgave</span>
               : <span style={S.badge}>{task.frequency==="daily"?"Daglig":"Ugentlig"}</span>
@@ -268,17 +328,34 @@ function TaskCard({ task, onToggle, onEdit, onDelete }) {
 function PersonSummary({ person, tasks }) {
   const { daily, weekly, mlDaily, mlWeekly } = calcTime(tasks, person);
   const color = COLORS[person];
+
+  if (person === "Fælles") {
+    // Fælles card: just show total and status
+    const mine = tasks.filter(t=>t.person==="Fælles"&&!t.isOnetime);
+    const done = mine.filter(t=>t.done).length;
+    return (
+      <div style={{...S.summary, borderTop:`3px solid ${color}`}}>
+        <div style={{...S.personName,color}}>🤝 Fælles</div>
+        <div style={S.statSLbl}>Opgaver</div>
+        <div style={{fontSize:22,fontWeight:700,color:"#1a1a2e",marginBottom:4}}>{done}/{mine.length}</div>
+        <div style={{fontSize:11,color:"#888"}}>udført</div>
+        <div style={S.progressBg} ><div style={{...S.progressFill,width:mine.length?`${Math.round(done/mine.length*100)}%`:"0%",background:color}}/></div>
+      </div>
+    );
+  }
+
   const mine  = tasks.filter(t=>t.person===person && !t.isOnetime);
   const doneD = mine.filter(t=>t.frequency==="daily"  && t.done).length;
   const doneW = mine.filter(t=>t.frequency==="weekly" && t.done).length;
   const totD  = mine.filter(t=>t.frequency==="daily").length;
   const totW  = mine.filter(t=>t.frequency==="weekly").length;
   const pct   = totD ? Math.round(doneD/totD*100) : (totW ? Math.round(doneW/totW*100) : 0);
+
   return (
     <div style={{...S.summary, borderTop:`3px solid ${color}`}}>
       <div style={{...S.personName,color}}>{person}</div>
       <div>
-        <div style={S.statSLbl}>⏱ Tid</div>
+        <div style={S.statSLbl}>⏱ Tid <span style={{fontWeight:400,color:"#bbb"}}>(inkl. fælles)</span></div>
         <div style={S.statRow}>
           <div style={S.stat}><span style={S.statNum}>{daily}</span><span style={S.statLbl}>min/dag</span></div>
           <div style={S.stat}><span style={S.statNum}>{weekly}</span><span style={S.statLbl}>min/uge</span></div>
@@ -322,44 +399,70 @@ function Statistics({ history }) {
         ))}
       </div>
       {periods.map(pk => {
-        const entries = history.filter(r=>r.period_key===pk && (selP==="all"||r.person===selP));
+        const allEntries = history.filter(r=>r.period_key===pk);
+        const entries = allEntries.filter(e => selP==="all" || e.person===selP || e.completed_by===selP);
         if (!entries.length) return null;
         const totalWork = entries.reduce((s,e)=>s+e.duration,0);
         const totalML   = entries.reduce((s,e)=>s+(e.mental_load||0),0);
         const doneCount = entries.filter(e=>e.done).length;
         const isWeek    = pk.includes("W");
+
+        // Per-person totals (fælles time goes to completedBy)
+        const personTotals = SOLO.map(p => {
+          const direct = allEntries.filter(e=>e.person===p);
+          const faellesDone = allEntries.filter(e=>e.person==="Fælles"&&e.done&&e.completed_by===p);
+          const all = [...direct,...faellesDone];
+          return {
+            p,
+            work: all.reduce((s,e)=>s+e.duration,0),
+            ml:   all.reduce((s,e)=>s+(e.mental_load||0),0),
+            done: all.filter(e=>e.done).length,
+            total: all.length,
+          };
+        });
+
         return (
           <div key={pk} style={S.histPeriod}>
             <div style={S.histPeriodHead}>
               <span style={S.histPeriodLabel}>{fmtDate(pk)}</span>
               <span style={S.histPeriodBadge}>{isWeek?"Ugentlig":"Daglig"}</span>
             </div>
-            <div style={{display:"flex",gap:10,marginBottom:10,flexWrap:"wrap"}}>
-              {(selP==="all"?PERSONS:[selP]).map(p=>{
-                const pe = entries.filter(e=>e.person===p);
-                if (!pe.length) return null;
-                return (
+
+            {/* Person totals */}
+            {selP==="all" && (
+              <div style={{display:"flex",gap:10,marginBottom:10,flexWrap:"wrap"}}>
+                {personTotals.map(({p,work,ml,done,total})=>(
                   <div key={p} style={{...S.histPersonChip,borderLeft:`3px solid ${COLORS[p]}`}}>
                     <span style={{fontWeight:700,color:COLORS[p],fontSize:13}}>{p}</span>
-                    <span style={S.histStat}>⏱ {pe.reduce((s,e)=>s+e.duration,0)} min</span>
-                    <span style={{...S.histStat,color:ML_COLOR}}>🧠 {pe.reduce((s,e)=>s+(e.mental_load||0),0)} min</span>
-                    <span style={S.histStat}>{pe.filter(e=>e.done).length}/{pe.length} udført</span>
+                    <span style={S.histStat}>⏱ {work} min</span>
+                    <span style={{...S.histStat,color:ML_COLOR}}>🧠 {ml} min</span>
+                    <span style={S.histStat}>{done}/{total} udført</span>
                   </div>
-                );
-              })}
-            </div>
-            {entries.map((e,i)=>(
-              <div key={i} style={{...S.histRow,opacity:e.done?1:0.5}}>
-                <span style={{...S.histDot,background:COLORS[e.person]||"#ccc"}}/>
-                <span style={{flex:1,fontSize:13,textDecoration:e.done?"none":"line-through",color:"#333"}}>{e.name}</span>
-                {e.is_onetime && <span style={{...S.onetimeBadge,fontSize:10}}>⚡</span>}
-                <span style={S.histTag}>⏱ {e.duration}m</span>
-                {e.mental_load>0&&<span style={{...S.histTag,color:ML_COLOR,background:"#f0e8ff"}}>🧠 {e.mental_load}m</span>}
-                <span style={{...S.histTag,background:e.done?"#e6f9ee":"#fee",color:e.done?"#27ae60":"#c0392b"}}>
-                  {e.done?"✓":"✗"}
-                </span>
+                ))}
               </div>
-            ))}
+            )}
+
+            {entries.map((e,i)=>{
+              const isFaelles = e.person==="Fælles";
+              const dotColor = isFaelles && e.completed_by ? COLORS[e.completed_by] : COLORS[e.person]||"#ccc";
+              return (
+                <div key={i} style={{...S.histRow,opacity:e.done?1:0.5}}>
+                  <span style={{...S.histDot,background:dotColor}}/>
+                  <span style={{flex:1,fontSize:13,textDecoration:e.done?"none":"line-through",color:"#333"}}>{e.name}</span>
+                  {isFaelles && e.completed_by && (
+                    <span style={{...S.histTag,background:COLORS[e.completed_by]+"22",color:COLORS[e.completed_by]}}>
+                      {e.completed_by}
+                    </span>
+                  )}
+                  {e.is_onetime && <span style={{...S.onetimeBadge,fontSize:10}}>⚡</span>}
+                  <span style={S.histTag}>⏱ {e.duration}m</span>
+                  {e.mental_load>0&&<span style={{...S.histTag,color:ML_COLOR,background:"#f0e8ff"}}>🧠 {e.mental_load}m</span>}
+                  <span style={{...S.histTag,background:e.done?"#e6f9ee":"#fee",color:e.done?"#27ae60":"#c0392b"}}>
+                    {e.done?"✓":"✗"}
+                  </span>
+                </div>
+              );
+            })}
             <div style={S.histFooter}>
               I alt: ⏱ {totalWork} min · 🧠 {totalML} min mental load · {doneCount}/{entries.length} udført
             </div>
@@ -374,13 +477,14 @@ function Statistics({ history }) {
 // MAIN APP
 // ─────────────────────────────────────────────
 export default function App() {
-  const [tasks,   setTasks]   = useState([]);
-  const [history, setHistory] = useState([]);
-  const [modal,   setModal]   = useState(null);
-  const [tab,     setTab]     = useState("daily");
-  const [loading, setLoading] = useState(true);
-  const [error,   setError]   = useState(null);
-  const [syncAt,  setSyncAt]  = useState(null);
+  const [tasks,      setTasks]      = useState([]);
+  const [history,    setHistory]    = useState([]);
+  const [modal,      setModal]      = useState(null);
+  const [claimModal, setClaimModal] = useState(null); // task object for fælles claiming
+  const [tab,        setTab]        = useState("daily");
+  const [loading,    setLoading]    = useState(true);
+  const [error,      setError]      = useState(null);
+  const [syncAt,     setSyncAt]     = useState(null);
   const pollRef = useRef(null);
 
   const fetchAll = useCallback(async () => {
@@ -418,12 +522,30 @@ export default function App() {
     return ()=>clearInterval(pollRef.current);
   }, [loading, fetchAll]);
 
-  async function toggle(id) {
-    const task = tasks.find(t=>t.id===id);
-    if (!task) return;
-    const newDone = !task.done;
-    setTasks(ts=>ts.map(t=>t.id===id?{...t,done:newDone}:t));
-    await sbUpdate("tasks", { id }, { done: newDone });
+  // Toggle: fælles tasks open a claim modal, others toggle directly
+  function handleToggle(task) {
+    if (task.person === "Fælles") {
+      setClaimModal(task);
+    } else {
+      toggleDirect(task.id, !task.done, null);
+    }
+  }
+
+  async function toggleDirect(id, done, completedBy) {
+    setTasks(ts=>ts.map(t=>t.id===id?{...t,done,completedBy}:t));
+    await sbUpdate("tasks", { id }, { done, completed_by: completedBy });
+  }
+
+  async function handleClaim(person) {
+    const task = claimModal;
+    setClaimModal(null);
+    await toggleDirect(task.id, true, person);
+  }
+
+  async function handleUnclaim() {
+    const task = claimModal;
+    setClaimModal(null);
+    await toggleDirect(task.id, false, null);
   }
 
   async function saveTask(form) {
@@ -432,7 +554,7 @@ export default function App() {
       await sbUpdate("tasks", { id: form.id }, taskToRow({...form}));
     } else {
       const newId = Date.now();
-      const newTask = { ...form, id: newId, done: false };
+      const newTask = { ...form, id: newId, done: false, completedBy: null };
       setTasks(ts=>[...ts, newTask]);
       await sbInsert("tasks", [taskToRow(newTask)]);
     }
@@ -459,11 +581,11 @@ export default function App() {
   const syncLabel  = syncAt ? new Date(syncAt).toLocaleTimeString("da-DK",{hour:"2-digit",minute:"2-digit",second:"2-digit"}) : "—";
 
   const TAB_DEFS = [
-    { key:"daily",   label:"Daglige",      count: tabTasks.daily.length },
-    { key:"weekly",  label:"Ugentlige",    count: tabTasks.weekly.length },
-    { key:"faelles", label:"🤝 Fælles",    count: tabTasks.faelles.length },
-    { key:"onetime", label:"⚡ Engangs",   count: tabTasks.onetime.length },
-    { key:"stats",   label:"Statistik",    count: [...new Set(history.map(r=>r.period_key))].length },
+    { key:"daily",   label:"Daglige",    count: tabTasks.daily.length },
+    { key:"weekly",  label:"Ugentlige",  count: tabTasks.weekly.length },
+    { key:"faelles", label:"🤝 Fælles",  count: tabTasks.faelles.length },
+    { key:"onetime", label:"⚡ Engangs", count: tabTasks.onetime.length },
+    { key:"stats",   label:"Statistik",  count: [...new Set(history.map(r=>r.period_key))].length },
   ];
 
   if (loading) return (
@@ -484,8 +606,6 @@ export default function App() {
       </div>
     </div>
   );
-
-  const currentTasks = tabTasks[tab] || [];
 
   return (
     <div style={S.root}>
@@ -526,17 +646,17 @@ export default function App() {
           }
         </div>
       )}
-      {tab==="faelles" && <div style={S.dateCtx}><span>🤝</span> Opgaver for jer begge</div>}
+      {tab==="faelles" && <div style={S.dateCtx}><span>🤝</span> Tryk afkrydsningen for at registrere hvem der tog opgaven</div>}
       {tab==="onetime" && <div style={S.dateCtx}><span>⚡</span> Forsvinder automatisk når de er udført og dagen er omme</div>}
 
       {tab!=="stats" && (
         <section style={{paddingTop:8}}>
-          {currentTasks.length===0
+          {(tabTasks[tab]||[]).length===0
             ? <div style={S.empty}>
                 {tab==="onetime" ? "Ingen engangopgaver — tilføj en med + Ny opgave!" : "Ingen opgaver her endnu."}
               </div>
-            : currentTasks.map(t=>
-                <TaskCard key={t.id} task={t} onToggle={toggle} onEdit={setModal} onDelete={deleteTask}/>
+            : (tabTasks[tab]||[]).map(t=>
+                <TaskCard key={t.id} task={t} onToggle={handleToggle} onEdit={setModal} onDelete={deleteTask}/>
               )
           }
         </section>
@@ -546,6 +666,15 @@ export default function App() {
 
       {modal!==null && (
         <Modal task={modal?.id?modal:null} onSave={saveTask} onClose={()=>setModal(null)}/>
+      )}
+
+      {claimModal && (
+        <ClaimModal
+          task={claimModal}
+          onClaim={handleClaim}
+          onUnclaim={handleUnclaim}
+          onClose={()=>setClaimModal(null)}
+        />
       )}
     </div>
   );
@@ -574,7 +703,7 @@ const S = {
   statNum:       { fontSize:18, fontWeight:700, color:"#1a1a2e" },
   statLbl:       { fontSize:9, color:"#888", textTransform:"uppercase", letterSpacing:0.5 },
   progressLabel: { fontSize:10, color:"#888", marginBottom:4, marginTop:6 },
-  progressBg:    { height:5, background:"#eee", borderRadius:3, overflow:"hidden" },
+  progressBg:    { height:5, background:"#eee", borderRadius:3, overflow:"hidden", marginTop:6 },
   progressFill:  { height:"100%", borderRadius:3, transition:"width .4s" },
 
   tabBar:        { padding:"12px 16px 0" },
